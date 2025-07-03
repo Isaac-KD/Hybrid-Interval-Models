@@ -2,10 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import copy
+
 from tqdm import trange
-from typing_extensions import override # For Python < 3.12, otherwise use typing.override
+from typing_extensions import override # For Python < 3.12
+from typing import Type,List, Dict, Any, Optional
 from torch.utils.data import DataLoader, TensorDataset # For batching in evaluation
+from sklearn.model_selection import KFold
 
 # Determine device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,45 +28,23 @@ class Macsum(nn.Module):
         else: 
             phi_init_tensor = phi_init.to(device=DEVICE, dtype=torch.float64)
 
-        self._phi = nn.Parameter(phi_init_tensor) # _phi est le paramètre à apprendre
+        # _phi est le paramètre à apprendre, il a requires_grad=True par défaut
+        self._phi = nn.Parameter(phi_init_tensor) 
         
-        # Ces attributs seront mis à jour par _recompute_phi_derived_attrs
-        self.phi_plus = None
-        self.phi_minus = None
-        self.perm_decreasing = None
-        self.perm_increasing = None
-        self.ranks_decreasing_for_phi = None 
-        self.ranks_increasing_for_phi = None 
-        
-        self._recompute_phi_derived_attrs()
+        # NOTE : On ne pré-calcule plus les attributs ici, car ils doivent être
+        # calculés à la volée dans forward() pour être dans le graphe de calcul.
 
     @property
     def phi(self):
-        # Retourne une copie sur CPU pour éviter des modifications accidentelles
         return self._phi.data.clone().cpu().numpy()
 
     def _recompute_phi_derived_attrs(self):
-        # Assure que _phi est bien 1D de taille N
-        if self._phi.shape != (self.N,): 
-            raise ValueError(f"Internal _phi must have shape ({self.N},), found {self._phi.shape}")
-        
-        # Utiliser .data ici est important pour l'approche du gradient manuel.
-        # Les permutations sont considérées comme fixes pour un calcul de gradient donné.
-        current_phi_values = self._phi.data 
-        self.phi_plus = torch.clamp_min(current_phi_values, 0)
-        self.phi_minus = torch.clamp_max(current_phi_values, 0)
-        
-        self.perm_decreasing = torch.argsort(current_phi_values, descending=True).long()
-        self.perm_increasing = torch.argsort(current_phi_values, descending=False).long()
-
-        self.ranks_decreasing_for_phi = torch.empty(self.N, dtype=torch.long, device=DEVICE)
-        self.ranks_decreasing_for_phi[self.perm_decreasing] = torch.arange(self.N, device=DEVICE)
-
-        self.ranks_increasing_for_phi = torch.empty(self.N, dtype=torch.long, device=DEVICE)
-        self.ranks_increasing_for_phi[self.perm_increasing] = torch.arange(self.N, device=DEVICE)
+        pass # Ne fait plus rien, tout est dans forward.
 
 
+    @override
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # --- DÉBUT DE LA CORRECTION MAJEURE ---
         original_ndim = x.ndim
         if original_ndim == 1:
             x = x.unsqueeze(0) 
@@ -70,13 +53,23 @@ class Macsum(nn.Module):
         if n_features != self.N:
             raise ValueError(f"Input x feature dim must be {self.N}, got {n_features}")
         
-        # Les attributs (phi_plus, perm_decreasing etc.) sont basés sur _phi.data
-        # et sont donc traités comme des constantes du point de vue d'autograd pour _phi.
-        x_permuted_by_phi_decreasing = x[:, self.perm_decreasing]
-        
-        phi_plus_sorted_decreasing = self.phi_plus[self.perm_decreasing]
-        phi_minus_sorted_decreasing = self.phi_minus[self.perm_decreasing]
+        # --- CALCULS FAITS À LA VOLÉE DANS FORWARD ---
+        # 1. Calculer les permutations (traitées comme des constantes par autograd)
+        # On utilise un bloc no_grad pour être explicite que le tri ne doit pas avoir de gradient.
+        with torch.no_grad():
+            perm_decreasing = torch.argsort(self._phi, descending=True).long()
 
+        # 2. Calculer phi_plus et phi_minus EN GARDANT LA CONNEXION AU GRAPHE
+        # On n'utilise PAS .data ou .detach() ici !
+        phi_plus = torch.clamp_min(self._phi, 0)
+        phi_minus = torch.clamp_max(self._phi, 0)
+
+        # 3. Appliquer la permutation à x et aux versions de phi
+        x_permuted_by_phi_decreasing = x[:, perm_decreasing]
+        phi_plus_sorted_decreasing = phi_plus[perm_decreasing]
+        phi_minus_sorted_decreasing = phi_minus[perm_decreasing]
+
+        # --- LE RESTE DU CALCUL RESTE IDENTIQUE ---
         acc_max_x_permuted = torch.cummax(x_permuted_by_phi_decreasing, dim=1).values
         acc_min_x_permuted = torch.cummin(x_permuted_by_phi_decreasing, dim=1).values
         
@@ -88,6 +81,8 @@ class Macsum(nn.Module):
         diff_running_max_x = padded_acc_max[:, 1:] - padded_acc_max[:, :-1]
         diff_running_min_x = padded_acc_min[:, 1:] - padded_acc_min[:, :-1]
         
+        # Ces matmul vont maintenant propager le gradient vers phi_plus et phi_minus,
+        # et donc vers self._phi.
         term_plus_for_upper = torch.matmul(diff_running_max_x, phi_plus_sorted_decreasing)
         term_minus_for_upper = torch.matmul(diff_running_min_x, phi_minus_sorted_decreasing)
         y_upper = term_plus_for_upper + term_minus_for_upper 
@@ -99,18 +94,26 @@ class Macsum(nn.Module):
         if original_ndim == 1:
             return y_lower.squeeze(0), y_upper.squeeze(0)
         return y_lower, y_upper
+        # --- FIN DE LA CORRECTION MAJEURE ---
 
     def _partial_derivative_torch_batch(self, X_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calcule les dérivées partielles de y_upper et y_lower par rapport à phi pour un batch.
-        Basé sur la Proposition 5.3 du papier.
-        X_batch: (batch_size, N)
-        Returns: (d_y_upper_d_phi_batch, d_y_lower_d_phi_batch), both (batch_size, N)
-        """
+        # Cette méthode est maintenant seulement utile pour le gradient MANUEL.
+        # On peut la laisser telle quelle, mais elle ne sera plus utilisée par fit_autograd.
+        
+        with torch.no_grad():
+            perm_decreasing = torch.argsort(self._phi, descending=True).long()
+            perm_increasing = torch.argsort(self._phi, descending=False).long()
+
+            ranks_decreasing_for_phi = torch.empty(self.N, dtype=torch.long, device=DEVICE)
+            ranks_decreasing_for_phi[perm_decreasing] = torch.arange(self.N, device=DEVICE)
+
+            ranks_increasing_for_phi = torch.empty(self.N, dtype=torch.long, device=DEVICE)
+            ranks_increasing_for_phi[perm_increasing] = torch.arange(self.N, device=DEVICE)
+        
         batch_size = X_batch.shape[0]
 
-        x_b = X_batch[:, self.perm_decreasing] 
-        x_d = X_batch[:, self.perm_increasing]  
+        x_b = X_batch[:, perm_decreasing] 
+        x_d = X_batch[:, perm_increasing]  
 
         padding = torch.zeros(batch_size, 1, dtype=X_batch.dtype, device=X_batch.device)
 
@@ -130,8 +133,8 @@ class Macsum(nn.Module):
         padded_acc_min_xd = torch.cat((padding, acc_min_xd), dim=1)
         diff_min_xd = padded_acc_min_xd[:, 1:] - padded_acc_min_xd[:, :-1] 
         
-        d_upper_batch = diff_max_xb[:, self.ranks_decreasing_for_phi] + diff_min_xd[:, self.ranks_increasing_for_phi]
-        d_lower_batch = diff_min_xb[:, self.ranks_decreasing_for_phi] + diff_max_xd[:, self.ranks_increasing_for_phi]
+        d_upper_batch = diff_max_xb[:, ranks_decreasing_for_phi] + diff_min_xd[:, ranks_increasing_for_phi]
+        d_lower_batch = diff_min_xb[:, ranks_decreasing_for_phi] + diff_max_xd[:, ranks_increasing_for_phi]
         
         return d_upper_batch, d_lower_batch
 
@@ -177,7 +180,7 @@ class Macsum(nn.Module):
         return (y_true - y_lower).pow(2) + (y_true - y_upper).pow(2)
 
     def fit_adam(self, X_train: np.ndarray, Y_train: np.ndarray,
-                 X_eval: np.ndarray, Y_eval: np.ndarray,
+                 X_eval: np.ndarray = None, Y_eval: np.ndarray=None,
                  learning_rate: float = 0.001, 
                  n_epochs: int = 100, 
                  batch_size: int = 32,
@@ -385,8 +388,160 @@ class MacsumSigmoidTorch(Macsum):
         
         return phi_grads_for_batch.mean(dim=0) # Gradient moyen (N,)
 
-    # Pas besoin d'overrider fit_adam, elle est héritée de Macsum et fonctionnera correctement
-    # grâce au polymorphisme de _loss et _get_phi_gradient_batch.
+
+class MacsumSigmoidTorchV2(Macsum):
+    def __init__(self, N, alpha: float = 0.2,  gamma_lower: float = 1.0,gamma_upper:float = 1.0, k_sigmoid: float = 0.5, phi_init=None):
+        super().__init__(N, phi_init)
+        self.alpha = alpha       # Poids pour la largeur de l'intervalle
+        self.gamma_lower = gamma_lower      # Poids pour la pénalité de non-contenu
+        self.gamma_upper = gamma_upper
+        self.k_sigmoid = k_sigmoid # Raideur de la sigmoïde pour la pénalité
+        
+    @override
+    def _loss(self, y_true: torch.Tensor, pred: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """ 
+        Calcule la fonction de coût combinée pour MacsumSigmoidTorch pour chaque échantillon.
+        Loss = α * (y_upper - y_lower) 
+               + γ * [ sig(k*(y_lower - y_true)) * (y_lower - y_true)^2 
+                     + sig(k*(y_true - y_upper)) * (y_true - y_upper)^2 ]
+        """
+        y_lower_pred, y_upper_pred = pred
+
+        if not isinstance(y_true, torch.Tensor):
+            y_true = torch.tensor(y_true, device=y_lower_pred.device, dtype=y_lower_pred.dtype)
+        
+        if y_true.ndim == 0 and y_lower_pred.ndim == 1 and y_lower_pred.shape[0] > 0 : 
+             y_true = y_true.expand_as(y_lower_pred)
+        elif y_true.ndim == 1 and y_lower_pred.ndim == 0 and y_true.shape[0] > 0: 
+             y_lower_pred = y_lower_pred.expand_as(y_true)
+             y_upper_pred = y_upper_pred.expand_as(y_true)
+
+        loss_spread = self.alpha * (y_upper_pred - y_lower_pred)
+
+        diff_lower = y_lower_pred - y_true  # Positif si y_lower_pred > y_true (mauvais)
+        diff_upper = y_true - y_upper_pred  # Positif si y_true > y_upper_pred (mauvais)
+        
+        penalty_lower = sigmoide_torch(diff_lower, self.k_sigmoid) * (diff_lower.pow(2))
+        penalty_upper = sigmoide_torch(diff_upper, self.k_sigmoid) * (diff_upper.pow(2))
+        
+        loss_penalty = self.gamma_lower * penalty_lower +  self.gamma_upper * penalty_upper
+        
+        combined_loss_per_sample = loss_spread + loss_penalty
+        return combined_loss_per_sample
+
+    @staticmethod
+    def loss_func_sigmoid(y_true: torch.Tensor, y_lower: torch.Tensor, y_upper: torch.Tensor,
+                          alpha: float, gamma: float, k_sigmoid: float) -> torch.Tensor:
+        """ Fonction de coût statique pour MacsumSigmoidTorch, utilisable en externe. """
+        if not isinstance(y_true, torch.Tensor):
+            y_true = torch.tensor(y_true, device=y_lower.device, dtype=y_lower.dtype)
+
+        loss_spread = alpha * (y_upper - y_lower)**2
+
+        diff_lower = y_lower - y_true
+        diff_upper = y_true - y_upper
+        
+        penalty_lower = sigmoide_torch(diff_lower, k_sigmoid) * (diff_lower.pow(2))
+        penalty_upper = sigmoide_torch(diff_upper, k_sigmoid) * (diff_upper.pow(2))
+        
+        loss_penalty = gamma * (penalty_lower + penalty_upper)
+        
+        return loss_spread + loss_penalty
+
+    @override
+    def _get_phi_gradient_batch(self, X_batch: torch.Tensor, Y_batch: torch.Tensor,
+                                y_lower_pred_batch: torch.Tensor, y_upper_pred_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Calcule le gradient de la loss sigmoïde (définie dans self._loss de cette classe) 
+        par rapport à _phi pour un batch. Retourne le gradient moyen sur le batch.
+        dL/dphi = (dL/dy_upper * dy_upper/dphi) + (dL/dy_lower * dy_lower/dphi)
+        """
+        # dy_upper/dphi et dy_lower/dphi sont donnés par _partial_derivative_torch_batch
+        # Shapes: (batch_size, N)
+        grad_phi_y_upper_batch, grad_phi_y_lower_batch = self._partial_derivative_torch_batch(X_batch)
+
+        # Y_batch, y_lower_pred_batch, y_upper_pred_batch shapes: (batch_size,)
+        
+        # Calcul de z_l = y_lower_pred - y_true et z_u = y_true - y_upper_pred
+        z_l = y_lower_pred_batch - Y_batch
+        z_u = Y_batch - y_upper_pred_batch
+
+        # s_l = sig(k*z_l), s_u = sig(k*z_u)
+        s_l = sigmoide_torch(z_l, self.k_sigmoid)
+        s_u = sigmoide_torch(z_u, self.k_sigmoid)
+
+        # Calcul de dL/dy_lower_pred_batch et dL/dy_upper_pred_batch
+        # L = alpha * (y_upper - y_lower) + gamma * (P_l + P_u)
+        # P_l = sig(k*z_l) * z_l^2  => dP_l/dz_l = k*s_l*(1-s_l)*z_l^2 + 2*z_l*s_l
+        # P_u = sig(k*z_u) * z_u^2  => dP_u/dz_u = k*s_u*(1-s_u)*z_u^2 + 2*z_u*s_u
+        
+        # dL/dy_lower = -alpha + gamma * (dP_l/dz_l) * (dz_l/dy_lower)
+        # dz_l/dy_lower = 1
+        term_penalty_deriv_lower = self.gamma_lower * (
+            self.k_sigmoid * s_l * (1 - s_l) * z_l.pow(2) + 2 * z_l * s_l
+        )
+        dL_d_y_lower_batch = -self.alpha + term_penalty_deriv_lower
+        
+        # dL/dy_upper = alpha + gamma * (dP_u/dz_u) * (dz_u/dy_upper)
+        # dz_u/dy_upper = -1
+        term_penalty_deriv_upper = -self.gamma_upper * (
+            self.k_sigmoid * s_u * (1 - s_u) * z_u.pow(2) + 2 * z_u * s_u
+        )
+        dL_d_y_upper_batch = self.alpha + term_penalty_deriv_upper
+
+        # Combinaison pour le gradient de phi
+        # Unsqueeze pour broadcast: (batch_size, 1) * (batch_size, N) -> (batch_size, N)
+        phi_grads_for_batch = (
+            dL_d_y_upper_batch.unsqueeze(1) * grad_phi_y_upper_batch +
+            dL_d_y_lower_batch.unsqueeze(1) * grad_phi_y_lower_batch
+        ) 
+        
+        return phi_grads_for_batch.mean(dim=0) # Gradient moyen (N,)
+    
+    
+def cross_validate_macsum(
+    model_class: Type[Macsum],
+    X: np.ndarray,
+    Y: np.ndarray,
+    n_splits: int = 5,
+    n_epochs:int = 100,
+    batch_size:int = 64,
+    learning_rate:float = 1e-3,
+    epsilon_conv:float = 1e-4,
+    phi_true:np.ndarray = None,
+    beta1:float = 0.8,
+    beta2:float=0.999,
+    random_state: int = 42,
+) -> tuple[dict, list[dict]]:
+    """
+    Effectue une validation croisée k-fold pour un modèle de type Macsum.
+
+    Args:
+        model_class (Type[Macsum]): La classe du modèle à utiliser (ex: Macsum ou MacsumSigmoidTorch).
+        model_params (dict): Dictionnaire des paramètres pour l'initialisation du modèle 
+                             (ex: {'N': ..., 'alpha': ...}).
+        fit_params (dict): Dictionnaire des paramètres pour la méthode `fit_adam`
+                           (ex: {'learning_rate': ..., 'n_epochs': ...}).
+        X_data (np.ndarray): L'ensemble des caractéristiques (features).
+        Y_data (np.ndarray): L'ensemble des cibles (labels).
+        n_splits (int): Le nombre de plis (k) pour la validation croisée.
+        random_state (int): Graine aléatoire pour la reproductibilité du découpage.
+        verbose (bool): Si True, affiche la progression et les résultats de chaque pli.
+
+    Returns:
+        tuple[dict, list[dict]]: 
+        - Un dictionnaire contenant les métriques moyennes et l'écart-type sur tous les plis.
+        - Une liste de dictionnaires, où chaque dictionnaire contient les métriques pour un pli.
+    """
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_results = []
+    for fold_idx, (train_index, val_index) in enumerate(kf.split(X)):
+        print(" tour :",fold_idx," / ", n_splits)
+        model = copy.deepcopy(model_class)
+        model.fit_adam(X[train_index],Y[train_index],X[ val_index],Y[ val_index],n_epochs=n_epochs,batch_size=batch_size,phi_true_for_eval=phi_true,learning_rate=learning_rate,epsilon_conv=epsilon_conv,beta1=beta1,beta2=beta2)
+        fold_results.append(model.history)
+    return fold_results
+    
 
 def evaluate_model_complet(X_np: np.ndarray, Y_np: np.ndarray, 
                            macsum_model: Macsum, # Peut être Macsum ou MacsumSigmoidTorch
@@ -454,69 +609,203 @@ def evaluate_model_complet(X_np: np.ndarray, Y_np: np.ndarray,
 
     if phi_true_np is not None:
         phi_model_np = macsum_model.phi 
-        metrics["phi_distance_l2"] = np.linalg.norm(phi_model_np - phi_true_np)
+        metrics["phi_distance_l2_normal"] = np.linalg.norm(phi_model_np - phi_true_np)/macsum_model.N
     else:
-        metrics["phi_distance_l2"] = None
+        metrics["phi_distance_l2_normal"] = None
 
     return metrics
 
-def plot_metrics_complet(history_list_of_dicts):
-    if not history_list_of_dicts:
-        print("No history to plot.")
+def plot_metrics_complet(list_of_histories: List[List[Dict[str, Any]]],title: str = "Résultats agrégés de la validation croisée" ):
+    """
+    Trace les métriques agrégées (moyenne et écart-type) à partir d'une liste
+    d'historiques provenant d'une validation croisée.
+    """
+    if not list_of_histories or not any(h for h in list_of_histories):
+        print("La liste d'historiques est vide ou ne contient que des listes vides.")
         return
 
-    all_keys = set()
-    for d in history_list_of_dicts:
-        all_keys.update(d.keys())
+    all_data = []
+    for fold_idx, history in enumerate(list_of_histories):
+        if not history: continue
+        for point in history:
+            record = point.copy()
+            record['fold'] = fold_idx
+            all_data.append(record)
     
-    history_dict = {key: [dic.get(key) for dic in history_list_of_dicts] 
-                    for key in all_keys}
-    
-    epochs = history_dict.get('epoch', list(range(len(history_list_of_dicts))))
-    if not epochs or not any(e is not None for e in epochs) : 
-        epochs = list(range(len(history_list_of_dicts)))
-
+    if not all_data:
+        print("Aucun point de données valide trouvé dans les historiques.")
+        return
+        
+    df = pd.DataFrame(all_data)
 
     metrics_to_plot = [
         'avg_train_loss', 'avg_eval_loss', 'containment_rate',
-        'avg_interval_spread', 'avg_misp_distance', 'phi_distance_l2',
-        "median_interval_spread", "q95_interval_spread"  
+        'avg_interval_spread', 'avg_misp_distance', 'phi_distance_l2_normal',
+        'median_interval_spread', 'q95_interval_spread'
     ]
+    
+    available_metrics = [m for m in metrics_to_plot if m in df.columns]
 
-    plottable_metrics_data = {}
-    for metric_name in metrics_to_plot:
-        if metric_name in history_dict:
-            values = history_dict[metric_name]
-            valid_indices = [i for i, val in enumerate(values) 
-                             if val is not None and not (isinstance(val, float) and np.isnan(val))]
-            
-            if valid_indices:
-                current_epochs = [epochs[i] for i in valid_indices if i < len(epochs)] # ensure epoch index is valid
-                current_values = [values[i] for i in valid_indices]
-                valid_epochs_values = [(ep, val) for ep, val in zip(current_epochs, current_values) if ep is not None]
-                if valid_epochs_values:
-                    plottable_metrics_data[metric_name] = (
-                        [item[0] for item in valid_epochs_values], 
-                        [item[1] for item in valid_epochs_values]
-                    )
+    if 'epoch' not in df.columns:
+        print("Erreur : La clé 'epoch' est manquante.")
+        return
 
-    num_plots = len(plottable_metrics_data)
+    # --- CORRECTION CLÉ : Assurer que les colonnes sont numériques ---
+    # Convertit les colonnes en type numérique. Les valeurs non numériques (comme None)
+    # deviendront NaN, qui est correctement géré par mean() et std().
+    for metric in available_metrics:
+        df[metric] = pd.to_numeric(df[metric], errors='coerce')
+    # --- FIN DE LA CORRECTION ---
+
+    aggregated_stats = df.groupby('epoch')[available_metrics].agg(['mean', 'std'])
+
+    num_plots = len(available_metrics)
     if num_plots == 0:
-        print("No plottable metrics with valid data found in history.")
+        print("Aucune des métriques à tracer n'a été trouvée.")
         return
         
     cols = 2
     rows = (num_plots + cols - 1) // cols
-
-    plt.figure(figsize=(6 * cols, 4 * rows))
-    plot_idx = 1
-    for metric_name, (valid_epochs, valid_values) in plottable_metrics_data.items():
-         plt.subplot(rows, cols, plot_idx)
-         plt.plot(valid_epochs, valid_values, marker='.')
-         plt.title(metric_name.replace("_", " ").title())
-         plt.xlabel("Époque")
-         plt.grid(True)
-         plot_idx += 1
     
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 5 * rows), squeeze=False)
+    fig.suptitle(title, fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+
+    for i, metric_name in enumerate(available_metrics):
+        ax = axes[i]
+        
+        # Le .dropna() est une sécurité supplémentaire pour éviter de tracer des points
+        # où la moyenne elle-même est NaN (si pour une époque, TOUTES les valeurs étaient None).
+        stats = aggregated_stats[metric_name].dropna()
+        if stats.empty:
+            ax.set_title(f"{metric_name.replace('_', ' ').title()}\n(Pas de données valides)", fontsize=12)
+            continue
+            
+        epochs = stats.index
+        mean_values = stats['mean']
+        std_values = stats['std'].fillna(0) # std peut être NaN si un seul pli a des données pour une époque
+
+        ax.plot(epochs, mean_values, marker='o', markersize=4, linestyle='-', label='Moyenne sur les plis')
+        ax.fill_between(
+            epochs,
+            mean_values - std_values,
+            mean_values + std_values,
+            alpha=0.2,
+            label='± 1 écart-type'
+        )
+        
+        ax.set_title(metric_name.replace("_", " ").title(), fontsize=12)
+        ax.set_xlabel("Époque")
+        ax.set_ylabel("Valeur")
+        ax.legend()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    for i in range(num_plots, len(axes)):
+        axes[i].set_visible(False)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+    
+def plot_multiple_histories_by_key ( list_of_histories: List[List[Dict[str, Any]]],
+    key_to_plot: str,
+    aggregate: bool = False, # NOUVEAU: Mettre à True pour le graphique agrégé
+    labels: Optional[List[str]] = None,
+    reference_value: Optional[float] = None,
+    title: Optional[str] = None,
+    xlabel: str = "Époque",
+    ylabel: str = "Valeur"
+):
+    """
+    Trace l'évolution d'une métrique pour plusieurs historiques.
+    Peut soit tracer chaque historique séparément, soit tracer leur moyenne agrégée.
+
+    Args:
+        list_of_histories (List[List[Dict]]): 
+            Liste d'historiques (ex: sortie de validation croisée).
+        key_to_plot (str): 
+            La clé de la métrique à tracer.
+        aggregate (bool): 
+            Si True, trace la moyenne et l'écart-type de tous les historiques.
+            Si False, trace une ligne distincte pour chaque historique.
+        labels (Optional[List[str]]): 
+            Étiquettes pour chaque courbe (utilisé uniquement si aggregate=False).
+        reference_value (Optional[float]): 
+            Trace une ligne de référence horizontale.
+        title (Optional[str]): 
+            Titre du graphique.
+        xlabel (str), ylabel (str): Étiquettes des axes.
+    """
+    # --- 1. Préparation robuste des données avec Pandas ---
+    if not list_of_histories or not any(h for h in list_of_histories):
+        print("La liste d'historiques est vide. Impossible de tracer.")
+        return
+
+    all_data = []
+    for fold_idx, history in enumerate(list_of_histories):
+        if not history: continue
+        for point in history:
+            record = point.copy()
+            record['fold'] = fold_idx
+            all_data.append(record)
+    
+    if not all_data:
+        print(f"Aucune donnée trouvée pour la clé '{key_to_plot}'.")
+        return
+        
+    df = pd.DataFrame(all_data)
+
+    # Vérification et nettoyage des colonnes nécessaires
+    if key_to_plot not in df.columns or 'epoch' not in df.columns:
+        print(f"Les clés 'epoch' ou '{key_to_plot}' sont manquantes. Impossible de tracer.")
+        return
+    df[key_to_plot] = pd.to_numeric(df[key_to_plot], errors='coerce')
+    df['epoch'] = pd.to_numeric(df['epoch'], errors='coerce')
+    df.dropna(subset=[key_to_plot, 'epoch'], inplace=True)
+    if df.empty:
+        print(f"Aucune donnée valide trouvée pour la clé '{key_to_plot}' après nettoyage.")
+        return
+
+    # --- 2. Configuration du graphique ---
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # --- 3. Logique de traçage (agrégé ou séparé) ---
+    if aggregate:
+        # --- CAS AGRÉGÉ (le style que vous aimez) ---
+        stats = df.groupby('epoch')[key_to_plot].agg(['mean', 'std'])
+        epochs = stats.index
+        mean_values = stats['mean']
+        std_values = stats['std'].fillna(0)
+
+        ax.plot(epochs, mean_values, marker='o', markersize=4, linestyle='-', label=f"Mean of '{key_to_plot}'")
+        ax.fill_between(
+            epochs, mean_values - std_values, mean_values + std_values,
+            alpha=0.2, label='± 1 standard deviation across cross-validation folds'
+        )
+    else:
+        # --- CAS LIGNES SÉPARÉES (comportement original amélioré) ---
+        if labels is None:
+            labels = [f"Courbe {i+1}" for i in range(len(list_of_histories))]
+        
+        for fold_id in sorted(df['fold'].unique()):
+            fold_df = df[df['fold'] == fold_id]
+            label = labels[int(fold_id)] if int(fold_id) < len(labels) else f"Courbe {int(fold_id)+1}"
+            ax.plot(fold_df['epoch'], fold_df[key_to_plot], marker='.', linestyle='-', label=label)
+
+    # --- 4. Finalisation du graphique ---
+    if reference_value is not None:
+        ax.axhline(y=reference_value, color='crimson', linestyle='--', label=f"Référence with True Kernel = {reference_value:.2f}")
+
+    if title is None:
+        agg_str = "Agrégée" if aggregate else "Individuelle"
+        title = f"Évolution {agg_str} de {key_to_plot.replace('_', ' ').title()}"
+    ax.set_title(title, fontsize=16, fontweight='bold')
+    
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.legend()
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
     plt.tight_layout()
     plt.show()

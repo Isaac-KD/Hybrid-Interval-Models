@@ -107,7 +107,7 @@ def generate_data(
              # Si l'intervalle est quasi nul, le bruit sera basé sur noise_level absolu * une échelle
              # ou une valeur par défaut pour éviter un bruit nul ou infini si noise_level est grand.
              # On peut aussi choisir de ne pas ajouter de bruit dans ce cas.
-             noise_scale = 1.0 # Échelle par défaut pour le bruit si l'intervalle est nul
+             noise_scale = 0.01 # Échelle par défaut pour le bruit si l'intervalle est nul
         else:
             noise_scale = interval_spread
              
