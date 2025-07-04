@@ -138,7 +138,6 @@ class MacsumNet(MacsumSigmoidTorch):
             for layer in self.layers:
                 layer._recompute_phi_derived_attrs_for_all()
 
-    # CORRECTION : Ajout de beta1 et beta2 et utilisation dans l'optimiseur.
     def fit_autograd(self, X_train: np.ndarray, Y_train: np.ndarray,
                      X_eval: np.ndarray = None, Y_eval: np.ndarray = None,
                      learning_rate: float = 0.001, 
