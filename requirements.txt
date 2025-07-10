@@ -1,0 +1,16 @@
+# Noyau de calcul scientifique et Deep Learning
+torch==2.3.0
+numpy==1.26.4
+
+# Manipulation de données et utilitaires
+pandas==2.2.1
+scikit-learn==1.5.2
+tqdm==4.66.2
+
+# Visualisation
+matplotlib==3.9.2
+plotly==5.20.0
+seaborn==0.13.2
+
+# Dépendances diverses et helpers de typage
+typing_extensions==4.13.2

@@ -69,7 +69,6 @@ class Macsum(nn.Module):
         phi_plus_sorted_decreasing = phi_plus[perm_decreasing]
         phi_minus_sorted_decreasing = phi_minus[perm_decreasing]
 
-        # --- LE RESTE DU CALCUL RESTE IDENTIQUE ---
         acc_max_x_permuted = torch.cummax(x_permuted_by_phi_decreasing, dim=1).values
         acc_min_x_permuted = torch.cummin(x_permuted_by_phi_decreasing, dim=1).values
         
@@ -94,11 +93,8 @@ class Macsum(nn.Module):
         if original_ndim == 1:
             return y_lower.squeeze(0), y_upper.squeeze(0)
         return y_lower, y_upper
-        # --- FIN DE LA CORRECTION MAJEURE ---
 
     def _partial_derivative_torch_batch(self, X_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Cette méthode est maintenant seulement utile pour le gradient MANUEL.
-        # On peut la laisser telle quelle, mais elle ne sera plus utilisée par fit_autograd.
         
         with torch.no_grad():
             perm_decreasing = torch.argsort(self._phi, descending=True).long()
@@ -174,7 +170,6 @@ class Macsum(nn.Module):
     
     @staticmethod
     def loss_func(y_true: torch.Tensor, y_lower: torch.Tensor, y_upper: torch.Tensor) -> torch.Tensor:
-        # Cette fonction statique est cohérente avec la loss de Macsum (non-sigmoide)
         if not isinstance(y_true, torch.Tensor):
             y_true = torch.tensor(y_true, device=y_lower.device, dtype=y_lower.dtype)
         return (y_true - y_lower).pow(2) + (y_true - y_upper).pow(2)
@@ -650,12 +645,8 @@ def plot_metrics_complet(list_of_histories: List[List[Dict[str, Any]]],title: st
         print("Erreur : La clé 'epoch' est manquante.")
         return
 
-    # --- CORRECTION CLÉ : Assurer que les colonnes sont numériques ---
-    # Convertit les colonnes en type numérique. Les valeurs non numériques (comme None)
-    # deviendront NaN, qui est correctement géré par mean() et std().
     for metric in available_metrics:
         df[metric] = pd.to_numeric(df[metric], errors='coerce')
-    # --- FIN DE LA CORRECTION ---
 
     aggregated_stats = df.groupby('epoch')[available_metrics].agg(['mean', 'std'])
 
@@ -676,7 +667,6 @@ def plot_metrics_complet(list_of_histories: List[List[Dict[str, Any]]],title: st
         ax = axes[i]
         
         # Le .dropna() est une sécurité supplémentaire pour éviter de tracer des points
-        # où la moyenne elle-même est NaN (si pour une époque, TOUTES les valeurs étaient None).
         stats = aggregated_stats[metric_name].dropna()
         if stats.empty:
             ax.set_title(f"{metric_name.replace('_', ' ').title()}\n(Pas de données valides)", fontsize=12)
@@ -709,7 +699,7 @@ def plot_metrics_complet(list_of_histories: List[List[Dict[str, Any]]],title: st
     
 def plot_multiple_histories_by_key ( list_of_histories: List[List[Dict[str, Any]]],
     key_to_plot: str,
-    aggregate: bool = False, # NOUVEAU: Mettre à True pour le graphique agrégé
+    aggregate: bool = False,
     labels: Optional[List[str]] = None,
     reference_value: Optional[float] = None,
     title: Optional[str] = None,

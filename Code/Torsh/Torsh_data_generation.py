@@ -1,5 +1,3 @@
-# --- START OF FILE data_generation_torch.py ---
-
 from typing import Tuple
 import numpy as np
 import pandas as pd
@@ -9,21 +7,19 @@ import torch
 from Code.Torsh.TorchMacsumAggregationLearning import *
 
 def generate_data(
-    macsum_model: 'Macsum', # Utiliser 'Macsum' en string pour forward reference si Macsum n'est pas encore défini
+    macsum_model: 'Macsum', 
     phi_true_np: np.ndarray,
     n_samples: int,
     noise_level: float = 0.01,
-    borne: float = 50.0, # Changé en float pour la cohérence
+    borne: float = 50.0, 
     generation: str = "uniform",
     multi: int = 1,
-    # Ajouter DTYPE comme argument si non globalement accessible
-    # model_dtype: torch.dtype = torch.float32 # Par défaut à float32
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Génère un jeu de données (X, Y) qui suit la logique du modèle Macsum (version PyTorch).
     Utilise le dtype du paramètre _phi du modèle pour la création des tenseurs.
     """
-    n_features = len(phi_true_np) # Ou macsum_model.N
+    n_features = len(phi_true_np) # 
     X_list = []
 
     if generation == "uniform":
@@ -49,12 +45,10 @@ def generate_data(
     X = np.concatenate(X_list, axis=0)
     
     current_total_samples = X.shape[0]
-    # Y = np.zeros(current_total_samples) # Initialisé plus tard avec le bon dtype
 
     # Récupérer le dtype et device directement depuis le modèle
-    # Ceci est crucial pour la compatibilité MPS
     model_device = macsum_model._phi.device
-    model_dtype = macsum_model._phi.dtype # Ce sera DTYPE (e.g. torch.float32 sur MPS)
+    model_dtype = macsum_model._phi.dtype 
 
     # Mettre le modèle en mode évaluation (déjà fait implicitement si on n'appelle pas .train())
     macsum_model.eval()
@@ -73,7 +67,7 @@ def generate_data(
     with torch.no_grad(): # Important si on modifie les paramètres du modèle
         # Créer le tenseur avec le dtype et device du modèle
         new_phi_tensor = torch.tensor(phi_true_np_casted, dtype=model_dtype, device=model_device)
-        macsum_model._phi.data.copy_(new_phi_tensor) # Utiliser copy_
+        macsum_model._phi.data.copy_(new_phi_tensor) 
         macsum_model._recompute_phi_derived_attrs()
 
     # Convertir X au bon type numpy et ensuite au tenseur avec le model_dtype
@@ -129,8 +123,7 @@ def save_data(X: np.ndarray, Y: np.ndarray, name: str ="data"):
         raise ValueError("X et Y doivent avoir le même nombre d'échantillons.")
 
     labels = [f"x{i}" for i in range(X.shape[1])]
-    labels.append("target") #  .insert(-1, "target") mettrait 'target' avant le dernier x si X a 1 colonne.
-                           #  .append("target") est plus sûr.
+    labels.append("target") 
 
     # Concaténer Y comme une nouvelle colonne à X
     data_to_save = np.column_stack((X, Y))
@@ -140,6 +133,41 @@ def save_data(X: np.ndarray, Y: np.ndarray, name: str ="data"):
     print(f"Data saved to {name}.csv")
 
 
+def generate_friedman1_data(n_samples: int, n_features: int, noise_std: float = 0.1):
+    """
+    Génère des données basées sur la fonction de test de Friedman #1.
+    
+    Args:
+        n_samples: Nombre d'échantillons à générer.
+        n_features: Nombre total de features. Doit être >= 5.
+        noise_std: Écart-type du bruit gaussien ajouté à la sortie.
+                   Mettre à 0 pour avoir des données parfaites (sans bruit).
+    
+    Returns:
+        Tuple (X, y) où X.shape=(n_samples, n_features) et y.shape=(n_samples,)
+    """
+    if n_features < 5:
+        raise ValueError("n_features must be at least 5 for Friedman #1 function.")
+        
+    X = np.random.rand(n_samples, n_features) * 10
+    
+    # Calculer la sortie Y en utilisant la formule
+    # Seules les 5 premières colonnes de X sont utilisées
+    term1 = 10 * np.sin(np.pi * X[:, 0] * X[:, 1])
+    term2 = 20 * (X[:, 2] - 0.5)**2
+    term3 = 10 * X[:, 3]
+    term4 = 5 * X[:, 4]
+    
+    y_true = term1 + term2 + term3 + term4
+    
+    # Ajouter du bruit gaussien si nécessaire
+    if noise_std > 0:
+        noise = np.random.normal(0, noise_std, n_samples)
+        y_noisy = y_true + noise
+        return X, y_noisy
+    else:
+        return X, y_true
+    
 def plot_points_2d(points, group_size, show_labels=False):
     """
     Affiche des groupes de points 2D sur un repère cartésien.
@@ -218,20 +246,20 @@ def plot_3d_points(X: np.ndarray, Y: np.ndarray):
         marker=dict(
             size=5,
             color=Y,
-            colorscale='Viridis', # 'Plasma', 'Inferno', 'Magma' sont aussi de bonnes options
+            colorscale='Viridis', # 'Plasma', 'Inferno', 'Magma' sont aussi possible
             colorbar=dict(title='Valeur Y'),
             opacity=0.8
         )
     )
 
     layout = go.Layout(
-        title='Visualisation 3D des données (X1, X2, Y)', # Ajout d'un titre
+        title='Visualisation 3D des données (X1, X2, Y)', 
         scene=dict(
             xaxis_title='X1 (Première caractéristique)',
             yaxis_title='X2 (Deuxième caractéristique)',
             zaxis_title='Y (Cible)'
         ),
-        margin=dict(l=0, r=0, b=0, t=40) # Marge pour le titre
+        margin=dict(l=0, r=0, b=0, t=40) 
     )
 
     fig = go.Figure(data=[scatter], layout=layout)

@@ -1,6 +1,6 @@
 import torch
 from Code.Torsh.TorchMacsumAggregationLearning import *
-import torch.nn.functional as F # Assurez-vous que cet import est en haut du fichier
+import torch.nn.functional as F 
 
 class MacsumLayer(nn.Module):
     """
@@ -65,7 +65,37 @@ class MacsumLayer(nn.Module):
         for unit in self.macsum_units:
             unit._recompute_phi_derived_attrs()
 
+class IntervalLinearLayer(nn.Module):
+    """
+    Une couche de perceptron (Linear + ReLU) qui opère sur des intervalles.
+    """
+    def __init__(self, in_features: int, out_features: int, activation_fn=F.relu):
+        super().__init__()
+        # On utilise une vraie couche Linear pour stocker les poids et le biais
+        self.linear = nn.Linear(in_features, out_features, dtype=torch.float64)
+        self.activation_fn = activation_fn
 
+    def forward(self, x_interval: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        x_lower, x_upper = x_interval
+        
+        # Récupérer les poids et le biais
+        weight = self.linear.weight
+        bias = self.linear.bias
+        
+        # Arithmétique des intervalles pour la transformation linéaire
+        W_plus = F.relu(weight)
+        W_minus = F.relu(-weight)
+        
+        y_lower = (x_lower @ W_plus.T) - (x_upper @ W_minus.T) + bias
+        y_upper = (x_upper @ W_plus.T) - (x_lower @ W_minus.T) + bias
+        
+        # Application de la fonction d'activation (si elle existe)
+        if self.activation_fn is not None:
+            y_lower = self.activation_fn(y_lower)
+            y_upper = self.activation_fn(y_upper)
+            
+        return y_lower, y_upper
+    
 class MacsumNet(MacsumSigmoidTorch):
     """
     Un réseau de neurones composé de couches de Macsum.
@@ -130,13 +160,17 @@ class MacsumNet(MacsumSigmoidTorch):
     @override
     def _recompute_phi_derived_attrs(self):
         """
-        CORRECTION: Ajout d'une protection.
-        Cette méthode est appelée par le constructeur parent AVANT que self.layers
-        ne soit défini. On vérifie donc son existence avant de l'utiliser.
+        Redéfinition pour s'assurer que les attributs dérivés de phi 
+        sont recalculés pour chaque unité dans chaque couche.
+        
+        CORRECTION HYBRIDE : On ne l'applique qu'aux couches qui ont cette méthode.
         """
         if hasattr(self, 'layers'):
             for layer in self.layers:
-                layer._recompute_phi_derived_attrs_for_all()
+                # On vérifie si la couche est bien une MacsumLayer avant d'appeler la méthode
+                if isinstance(layer, MacsumLayer):
+                    layer._recompute_phi_derived_attrs_for_all()
+                # Si c'est une IntervalLinearLayer, on ne fait rien, ce qui est correct.
 
     def fit_autograd(self, X_train: np.ndarray, Y_train: np.ndarray,
                      X_eval: np.ndarray = None, Y_eval: np.ndarray = None,
@@ -259,6 +293,102 @@ class MacsumNetWithActivation(MacsumNet): # Hérite de MacsumNet
         y_lower_final, y_upper_final = x_interval
         
         # Squeeze si la sortie est scalaire
+        if len(y_lower_final.shape) > 1 and y_lower_final.shape[1] == 1:
+            y_lower_final = y_lower_final.squeeze(1)
+            y_upper_final = y_upper_final.squeeze(1)
+            
+        return y_lower_final, y_upper_final
+
+class HybridNet(MacsumNet):
+    """
+    Une version améliorée du réseau hybride avec une définition d'architecture simplifiée.
+    """
+    def __init__(self, 
+                 input_dim: int,
+                 architecture: List[Dict[str, Any]],
+                 macsum_model_class: Type[Macsum] = MacsumSigmoidTorch,
+                 **macsum_params):
+        
+        # Initialisation de la classe parente (nécessaire pour la loss et fit_autograd)
+        # Le layer_config est factice, on va le remplacer.
+        super().__init__(layer_config=[input_dim, 1], model_class=macsum_model_class, **macsum_params)
+        
+        self.architecture = architecture
+        
+        self.layers = nn.ModuleList() # On écrase la liste de couches
+        self.input_dim = input_dim
+        
+        print("Construction du réseau hybride avec architecture simplifiée...")
+        
+        current_dim = self.input_dim
+        
+        for i, layer_config in enumerate(architecture):
+            layer_type = layer_config.get('type', '').lower()
+            
+            if not layer_type:
+                raise ValueError(f"La configuration de la couche {i} doit avoir un 'type' ('linear' ou 'macsum').")
+
+            if layer_type == 'linear':
+                out_features = layer_config.get('neurons')
+                if out_features is None:
+                    raise ValueError(f"La couche linear {i} doit spécifier le nombre de 'neurons'.")
+                
+                activation = layer_config.get('activation', F.relu) # ReLU par défaut
+                
+                layer = IntervalLinearLayer(current_dim, out_features, activation_fn=activation)
+                self.layers.append(layer)
+                
+                act_name = activation.__name__ if activation else 'None'
+                print(f"  Ajout couche Linear: {current_dim} -> {out_features} avec activation {act_name}")
+                
+                # La dimension de sortie de cette couche devient la dimension d'entrée de la suivante
+                current_dim = out_features
+
+            elif layer_type == 'macsum':
+                out_features = layer_config.get('neurons')
+                if out_features is None:
+                    raise ValueError(f"La couche macsum {i} doit spécifier le nombre de 'neurons'.")
+                    
+                # Une couche Macsum est en fait une MacsumLayer
+                layer = MacsumLayer(current_dim, out_features, macsum_model_class, **macsum_params)
+                self.layers.append(layer)
+                
+                print(f"  Ajout couche Macsum: {current_dim} -> {out_features}")
+                
+                # Mise à jour de la dimension
+                current_dim = out_features
+            else:
+                raise ValueError(f"Type de couche inconnu: {layer_type} à l'index {i}")
+
+    @override
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Passe avant améliorée qui applique une activation après CHAQUE couche cachée.
+        """
+        if x.shape[1] != self.input_dim:
+            raise ValueError(f"Dimension d'entrée incorrecte. Le réseau attend {self.input_dim} features, mais a reçu {x.shape[1]}.")
+            
+        x_interval = (x, x)
+        
+        num_layers = len(self.layers)
+        for i, layer in enumerate(self.layers):
+            # 1. Passe à travers la couche (Linear ou Macsum)
+            x_interval = layer(x_interval)
+            
+            layer_config = self.architecture[i]
+            activation_fn = layer_config.get('activation')
+            
+            # 3. Appliquer l'activation si elle est définie ET si ce n'est pas la dernière couche
+            if activation_fn is not None and i < num_layers - 1:
+                x_lower, x_upper = x_interval
+                
+                activated_lower = activation_fn(x_lower)
+                activated_upper = activation_fn(x_upper)
+                
+                x_interval = (activated_lower, activated_upper)
+
+        y_lower_final, y_upper_final = x_interval
+
         if len(y_lower_final.shape) > 1 and y_lower_final.shape[1] == 1:
             y_lower_final = y_lower_final.squeeze(1)
             y_upper_final = y_upper_final.squeeze(1)
