@@ -56,7 +56,7 @@ Le modèle phare de ce projet, `HybridNet`, a été conçu pour surmonter ces li
 
 Pour permettre cette hétérogénéité, les couches `Linear` ont été étendues pour manipuler des intervalles en s'appuyant sur l'**arithmétique des intervalles** formalisée par Ramon E. Moore :
 ```math
-y_{\text{lower}} = W^+ x_{\text{lower}} - W^- x_{\text{upper}} + b \\
+y_{\text{lower}} = W^+ x_{\text{lower}} - W^- x_{\text{upper}} + b \\ , \\
 y_{\text{upper}} = W^+ x_{\text{upper}} - W^- x_{\text{lower}} + b
 ```
 où `W⁺ = max(0, W)` et `W⁻ = max(0, -W)`. Cette combinaison permet d'allier la stabilité des MLP à la puissance de modélisation de `Macsum`.
