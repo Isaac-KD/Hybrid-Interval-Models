@@ -1,6 +1,6 @@
 # 🧠 IntervalNet: Architectures Neuronales pour la Régression par Intervalles
 
-Ce dépôt présente `Hybrid-Interval-Models`, une nouvelle famille de modèles de deep learning pour la **régression par intervalles**, développée dans le cadre d'un stage de recherche au sein du laboratoire **LIP6 (Sorbonne Université)**. Le point culminant de ce projet est `HybridNet`, une architecture flexible qui fusionne la puissance d'extraction de caractéristiques des perceptrons traditionnels avec `Macsum`, un nouvel opérateur d'agrégation dépendant de l'ordre.
+Ce dépôt présente `Hybrid-Interval-Models`, une nouvelle famille de modèles de deep learning pour la **régression par intervalles**, développée dans le cadre d'un stage de recherche au sein du laboratoire **LIP6 (Sorbonne Université)**. Le point culminant de ce projet est `HybridNet`, une architecture flexible qui fusionne la puissance d'extraction de caractéristiques des perceptrons traditionnels avec `Macsum`, un nouvel opérateur d'agrégation.
 
 Le résultat est un modèle capable de quantifier son incertitude en prédisant un intervalle `[borne_inférieure, borne_supérieure]`, une propriété essentielle pour des applications fiables en IA.
 
